@@ -1,0 +1,100 @@
+name: Auto-Sync Docker Hub Images to ACR (only when updated)
+
+on:
+  workflow_dispatch:          # 允许手动触发
+  schedule:
+    - cron: '0 2 * * *'      # 每天 UTC 2:00 执行，可改为你需要的频率
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image:
+          # 公开命名空间 jgyu 的镜像
+          - dockerhub: pgvector/pgvector:pg16
+            acr_repo: pgvector:pg16
+            namespace: jgyu
+          - dockerhub: xream/sub-store:latest
+            acr_repo: sub-store:latest
+            namespace: jgyu
+          - dockerhub: aoxijy/sub-web:2.5
+            acr_repo: sub-web:2.5
+            namespace: jgyu
+          - dockerhub: tindy2013/subconverter:latest
+            acr_repo: subconverter:latest
+            namespace: jgyu
+          - dockerhub: sigoden/dufs:v0.41.0
+            acr_repo: dufs:v0.41.0
+            namespace: jgyu
+          # 私有命名空间 gqru 的镜像（示例）
+          # - dockerhub: odoo:19.0
+          #   acr_repo: odoo:19.0
+          #   namespace: gqru
+
+    steps:
+      - name: Login to Alibaba Cloud ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
+            --username "${{ secrets.ACR_USERNAME }}" \
+            --password-stdin "${{ secrets.ACR_REGISTRY }}"
+
+      - name: Login to Docker Hub (optional, to avoid rate limits)
+        if: env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Check and Sync ${{ matrix.image.dockerhub }}
+        id: sync
+        run: |
+          DOCKERHUB_IMAGE="${{ matrix.image.dockerhub }}"
+          ACR_REPO="${{ matrix.image.acr_repo }}"
+          NAMESPACE="${{ matrix.image.namespace || secrets.ACR_NAMESPACE }}"
+          ACR_IMAGE="${{ secrets.ACR_REGISTRY }}/${NAMESPACE}/${ACR_REPO}"
+
+          # 获取 Docker Hub 最新摘要
+          echo "Checking Docker Hub image: $DOCKERHUB_IMAGE"
+          DH_DIGEST=$(docker manifest inspect "$DOCKERHUB_IMAGE" --verbose | jq -r '.Descriptor.digest // .config.digest' 2>/dev/null)
+          if [ -z "$DH_DIGEST" ]; then
+            echo "❌ Failed to get Docker Hub digest, skipping..."
+            exit 0
+          fi
+          echo "Docker Hub digest: $DH_DIGEST"
+
+          # 获取 ACR 中当前镜像摘要（如果存在）
+          ACR_DIGEST=$(docker manifest inspect "$ACR_IMAGE" --verbose | jq -r '.Descriptor.digest // .config.digest' 2>/dev/null)
+          if [ -n "$ACR_DIGEST" ]; then
+            echo "ACR digest: $ACR_DIGEST"
+          else
+            echo "ACR image does not exist or cannot be inspected, will sync."
+          fi
+
+          # 比较并决定是否同步
+          if [ "$DH_DIGEST" = "$ACR_DIGEST" ]; then
+            echo "✅ Digest is the same, no need to sync."
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "🔄 Digest changed (or ACR missing), will sync..."
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "acr_image=$ACR_IMAGE" >> $GITHUB_OUTPUT
+            echo "dockerhub_image=$DOCKERHUB_IMAGE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pull, Tag, and Push (only if changed)
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          ACR_IMAGE="${{ steps.sync.outputs.acr_image }}"
+          DOCKERHUB_IMAGE="${{ steps.sync.outputs.dockerhub_image }}"
+
+          echo "Pulling $DOCKERHUB_IMAGE..."
+          docker pull "$DOCKERHUB_IMAGE"
+
+          echo "Tagging as $ACR_IMAGE..."
+          docker tag "$DOCKERHUB_IMAGE" "$ACR_IMAGE"
+
+          echo "Pushing $ACR_IMAGE..."
+          docker push "$ACR_IMAGE"
