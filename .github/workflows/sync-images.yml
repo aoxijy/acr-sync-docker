@@ -1,17 +1,17 @@
 name: Auto-Sync Docker Hub Images to ACR (only when updated)
 
 on:
-  workflow_dispatch:          # 允许手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 2 * * *'      # 每天 UTC 2:00 执行，可改为你需要的频率
+    - cron: '0 2 * * *'
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false          # 防止一个镜像失败导致其他镜像被取消
       matrix:
         image:
-          # 公开命名空间 jgyu 的镜像
           - dockerhub: pgvector/pgvector:pg16
             acr_repo: pgvector:pg16
             namespace: jgyu
@@ -20,7 +20,7 @@ jobs:
             namespace: jgyu
           - dockerhub: btpanel/baota:lnmp
             acr_repo: baota:lnmp
-            namespace: jgyu            
+            namespace: jgyu
           - dockerhub: aoxijy/sub-web:2.5
             acr_repo: sub-web:2.5
             namespace: jgyu
@@ -30,10 +30,6 @@ jobs:
           - dockerhub: sigoden/dufs:v0.41.0
             acr_repo: dufs:v0.41.0
             namespace: jgyu
-          # 私有命名空间 gqru 的镜像（示例）
-          # - dockerhub: odoo:19.0
-          #   acr_repo: odoo:19.0
-          #   namespace: gqru
 
     steps:
       - name: Login to Alibaba Cloud ACR
@@ -42,8 +38,8 @@ jobs:
             --username "${{ secrets.ACR_USERNAME }}" \
             --password-stdin "${{ secrets.ACR_REGISTRY }}"
 
-      - name: Login to Docker Hub (optional, to avoid rate limits)
-        if: env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN
+      - name: Login to Docker Hub (using provided secrets)
+        # 现在您已添加这两个 secret，直接登录即可
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -53,35 +49,38 @@ jobs:
       - name: Check and Sync ${{ matrix.image.dockerhub }}
         id: sync
         run: |
+          set -euo pipefail
           DOCKERHUB_IMAGE="${{ matrix.image.dockerhub }}"
           ACR_REPO="${{ matrix.image.acr_repo }}"
-          NAMESPACE="${{ matrix.image.namespace || secrets.ACR_NAMESPACE }}"
+          NAMESPACE="${{ matrix.image.namespace }}"
           ACR_IMAGE="${{ secrets.ACR_REGISTRY }}/${NAMESPACE}/${ACR_REPO}"
 
-          # 获取 Docker Hub 最新摘要
-          echo "Checking Docker Hub image: $DOCKERHUB_IMAGE"
-          DH_DIGEST=$(docker manifest inspect "$DOCKERHUB_IMAGE" --verbose | jq -r '.Descriptor.digest // .config.digest' 2>/dev/null)
-          if [ -z "$DH_DIGEST" ]; then
-            echo "❌ Failed to get Docker Hub digest, skipping..."
+          # 使用 docker buildx imagetools 获取 Docker Hub digest（此时已登录，稳定可靠）
+          echo "Inspecting Docker Hub image: $DOCKERHUB_IMAGE"
+          DH_DIGEST=""
+          if ! DH_DIGEST=$(docker buildx imagetools inspect "$DOCKERHUB_IMAGE" --format '{{json .}}' 2>/dev/null | jq -r '.manifest.digest // .config.digest'); then
+            echo "⚠️ Failed to get digest from Docker Hub, will attempt to sync anyway."
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "acr_image=$ACR_IMAGE" >> $GITHUB_OUTPUT
+            echo "dockerhub_image=$DOCKERHUB_IMAGE" >> $GITHUB_OUTPUT
             exit 0
           fi
           echo "Docker Hub digest: $DH_DIGEST"
 
-          # 获取 ACR 中当前镜像摘要（如果存在）
-          ACR_DIGEST=$(docker manifest inspect "$ACR_IMAGE" --verbose | jq -r '.Descriptor.digest // .config.digest' 2>/dev/null)
-          if [ -n "$ACR_DIGEST" ]; then
-            echo "ACR digest: $ACR_DIGEST"
+          # 获取 ACR 中现有镜像的 digest
+          ACR_DIGEST=""
+          if ! ACR_DIGEST=$(docker buildx imagetools inspect "$ACR_IMAGE" --format '{{json .}}' 2>/dev/null | jq -r '.manifest.digest // .config.digest'); then
+            echo "⚠️ ACR image not found or inaccessible, will sync."
           else
-            echo "ACR image does not exist or cannot be inspected, will sync."
+            echo "ACR digest: $ACR_DIGEST"
           fi
 
-          # 比较并决定是否同步
-          if [ "$DH_DIGEST" = "$ACR_DIGEST" ]; then
-            echo "✅ Digest is the same, no need to sync."
+          # 比较 digest
+          if [ -n "$ACR_DIGEST" ] && [ "$DH_DIGEST" = "$ACR_DIGEST" ]; then
+            echo "✅ Digest unchanged, no need to sync."
             echo "changed=false" >> $GITHUB_OUTPUT
-            exit 0
           else
-            echo "🔄 Digest changed (or ACR missing), will sync..."
+            echo "🔄 Digest changed or ACR missing, will sync."
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "acr_image=$ACR_IMAGE" >> $GITHUB_OUTPUT
             echo "dockerhub_image=$DOCKERHUB_IMAGE" >> $GITHUB_OUTPUT
