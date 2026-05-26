@@ -18,6 +18,9 @@ jobs:
           - dockerhub: xream/sub-store:latest
             acr_repo: sub-store:latest
             namespace: jgyu
+          - dockerhub: btpanel/baota:lnmp
+            acr_repo: baota:lnmp
+            namespace: jgyu            
           - dockerhub: aoxijy/sub-web:2.5
             acr_repo: sub-web:2.5
             namespace: jgyu
